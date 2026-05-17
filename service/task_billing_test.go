@@ -3,12 +3,15 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/glebarez/sqlite"
@@ -607,6 +610,70 @@ func TestNonTerminalUpdate_NoBilling(t *testing.T) {
 	var reloaded model.Task
 	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
 	assert.Equal(t, "50%", reloaded.Progress)
+}
+
+type trackingReadCloser struct {
+	reader *strings.Reader
+	closed *bool
+}
+
+var _ io.ReadCloser = (*trackingReadCloser)(nil)
+
+func (r *trackingReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *trackingReadCloser) Close() error {
+	*r.closed = true
+	return nil
+}
+
+type nonOKSunoAdaptor struct {
+	body io.ReadCloser
+}
+
+func (a *nonOKSunoAdaptor) Init(_ *relaycommon.RelayInfo) {}
+func (a *nonOKSunoAdaptor) FetchTask(string, string, map[string]any, string) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       a.body,
+	}, nil
+}
+func (a *nonOKSunoAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) { return nil, nil }
+func (a *nonOKSunoAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+func TestUpdateSunoTasksClosesBodyOnNonOK(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const channelID = 81
+	baseURL := "https://example.com"
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id:      channelID,
+		Name:    "suno_non_ok",
+		Key:     "sk-test",
+		Status:  common.ChannelStatusEnabled,
+		BaseURL: &baseURL,
+	}).Error)
+
+	closed := false
+	originalGetTaskAdaptorFunc := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(platform constant.TaskPlatform) TaskPollingAdaptor {
+		require.Equal(t, constant.TaskPlatformSuno, platform)
+		return &nonOKSunoAdaptor{body: &trackingReadCloser{
+			reader: strings.NewReader("upstream failed"),
+			closed: &closed,
+		}}
+	}
+	t.Cleanup(func() {
+		GetTaskAdaptorFunc = originalGetTaskAdaptorFunc
+	})
+
+	err := updateSunoTasks(ctx, channelID, []string{"upstream-task"}, map[string]*model.Task{})
+	require.Error(t, err)
+	assert.True(t, closed)
 }
 
 // ===========================================================================
